@@ -1,0 +1,209 @@
+# @package _global_
+
+scratch:
+  resolution: 1008
+  train_batch_size: 1
+  num_train_workers: 10
+  num_frames: 8
+  max_num_objects: 16
+  base_lr: 5.0e-6
+  phases_per_epoch: 1
+  num_epochs: 40
+
+dataset:
+  img_folder: ./data/VOS-Endovis17/train/images
+  gt_folder: ./data/VOS-Endovis17/train/masks
+  file_list_txt: null  # Optional: txt file listing video names for training
+  multiplier: 100
+
+paths:
+  checkpoint: ./checkpoints/sam3.1_multiplex.pt   # PATH to SAM3.1 release checkpoint (.pt)
+
+launcher:
+  num_nodes: 1
+  gpus_per_node: 1
+  experiment_log_dir: null
+
+vos:
+  train_transforms:
+    - _target_: training.dataset.transforms.ComposeAPI
+      transforms:
+        - _target_: training.dataset.transforms.RandomHorizontalFlip
+          consistent_transform: True
+        - _target_: training.dataset.transforms.RandomAffine
+          degrees: 25
+          shear: 20
+          image_interpolation: bilinear
+          consistent_transform: True
+        - _target_: training.dataset.transforms.RandomResizeAPI
+          sizes: ${scratch.resolution}
+          square: true
+          consistent_transform: True
+        - _target_: training.dataset.transforms.ColorJitter
+          consistent_transform: True
+          brightness: 0.1
+          contrast: 0.03
+          saturation: 0.03
+          hue: null
+        - _target_: training.dataset.transforms.RandomGrayscale
+          p: 0.05
+          consistent_transform: True
+        - _target_: training.dataset.transforms.ColorJitter
+          consistent_transform: False
+          brightness: 0.1
+          contrast: 0.05
+          saturation: 0.05
+          hue: null
+        - _target_: training.dataset.transforms.ToTensorAPI
+        - _target_: training.dataset.transforms.NormalizeAPI
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+trainer:
+  _target_: training.trainer.Trainer
+  mode: train_only
+  max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
+  accelerator: cuda
+  seed_value: 2024
+
+  model:
+    _target_: training.model.sam3_multiplex_train.SAM3MultiplexTrain
+    image_size: ${scratch.resolution}
+    multiplex_count: 16
+    num_maskmem: 7
+    checkpoint_path: ${paths.checkpoint}
+
+    ####### Training specific params (follow SAM2 MOSE finetune exactly) #######
+    # box/point input and corrections
+    prob_to_use_pt_input_for_train: 0.5
+    prob_to_use_pt_input_for_eval: 0.0
+    prob_to_use_box_input_for_train: 0.5   # 0.5*0.5 = 0.25 prob to use box
+    prob_to_use_box_input_for_eval: 0.0
+    prob_to_sample_from_gt_for_train: 0.1
+    num_frames_to_correct_for_train: 2     # iteratively sample on random 1~2 frames
+    num_frames_to_correct_for_eval: 1
+    rand_frames_to_correct_for_train: true # random #init-cond-frame ~ 2
+    rand_frames_to_correct_for_eval: false
+    add_all_frames_to_correct_as_cond: true
+    # maximum 2 initial conditioning frames
+    num_init_cond_frames_for_train: 2
+    num_init_cond_frames_for_eval: 1
+    rand_init_cond_frames_for_train: true  # random 1~2
+    rand_init_cond_frames_for_eval: false
+    num_correction_pt_per_frame: 7
+    forward_backbone_per_frame_for_eval: true
+
+    ####### Freeze strategy #######
+    freeze_image_encoder: true
+    freeze_patterns:
+      - "maskmem_backbone.*"          # memory encoder (SimpleMaskEncoder + mask_downsampler)
+      - "no_obj_embed_spatial"        # per-slot empty object embedding
+      - "output_valid_embed"          # per-slot suppression embedding (valid)
+      - "output_invalid_embed"        # per-slot suppression embedding (invalid)
+
+  data:
+    train:
+      _target_: training.dataset.sam2_datasets.TorchTrainMixedDataset
+      phases_per_epoch: ${scratch.phases_per_epoch}
+      batch_sizes:
+        - ${scratch.train_batch_size}
+
+      datasets:
+        - _target_: training.dataset.utils.RepeatFactorWrapper
+          dataset:
+            _target_: training.dataset.utils.ConcatDataset
+            datasets:
+              - _target_: training.dataset.vos_dataset.VOSDataset
+                transforms: ${vos.train_transforms}
+                training: true
+                video_dataset:
+                  _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                  img_folder: ${dataset.img_folder}
+                  gt_folder: ${dataset.gt_folder}
+                  file_list_txt: ${dataset.file_list_txt}
+                sampler:
+                  _target_: training.dataset.vos_sampler.RandomUniformSampler
+                  num_frames: ${scratch.num_frames}
+                  max_num_objects: ${scratch.max_num_objects}
+                multiplier: ${dataset.multiplier}
+      shuffle: True
+      num_workers: ${scratch.num_train_workers}
+      pin_memory: True
+      drop_last: True
+      collate_fn:
+        _target_: training.utils.data_utils.collate_fn
+        _partial_: true
+        dict_key: all
+
+  loss:
+    all:
+      _target_: training.loss_fns.MultiStepMultiMasksAndIous
+      weight_dict:
+        loss_mask: 20
+        loss_dice: 1
+        loss_iou: 1
+        loss_class: 1
+      supervise_all_iou: true
+      iou_use_l1_loss: true
+      pred_obj_scores: true
+      focal_gamma_obj_score: 0.0
+      focal_alpha_obj_score: -1.0
+
+  optim:
+    amp:
+      enabled: true
+      amp_dtype: bfloat16
+
+    optimizer:
+      _target_: torch.optim.AdamW
+
+    gradient_clip:
+      _target_: training.optimizer.GradientClipper
+      max_norm: 0.1
+      norm_type: 2
+
+    # No layer_decay_param_modifier needed since backbone is fully frozen.
+    # All trainable params (tracker) use the same base_lr.
+    options:
+      lr:
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: ${scratch.base_lr}
+            end_value: ${divide:${scratch.base_lr},10}
+      weight_decay:
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: 0.1
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: 0.0
+          param_names:
+            - '*bias*'
+          module_cls_names: ['torch.nn.LayerNorm']
+
+  distributed:
+    backend: nccl
+    find_unused_parameters: true
+
+  logging:
+    tensorboard_writer:
+      _target_: training.utils.logger.make_tensorboard_logger
+      log_dir: ${launcher.experiment_log_dir}/tensorboard
+      flush_secs: 120
+      should_log: true
+    log_dir: ${launcher.experiment_log_dir}/logs
+    log_freq: 10
+
+  checkpoint:
+    save_dir: ${launcher.experiment_log_dir}/checkpoints
+    save_freq: 10
+
+submitit:
+  partition: null
+  account: null
+  qos: null
+  cpus_per_task: 10
+  use_cluster: false
+  timeout_hour: 24
+  name: null
+  port_range: [10000, 65000]

@@ -78,8 +78,8 @@ class VideoTrackingMultiplexDemo(VideoTrackingDynamicMultiplex):
             image_size=self.image_size,
             offload_video_to_cpu=offload_video_to_cpu,
             async_loading_frames=async_loading_frames,
-            use_torchcodec=use_torchcodec,
-            use_cv2=use_cv2,
+            # use_torchcodec=use_torchcodec,
+            # use_cv2=use_cv2,
         )
         inference_state = {}
         inference_state["images"] = images

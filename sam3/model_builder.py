@@ -74,10 +74,10 @@ def _create_position_encoding(precompute_resolution=None):
     )
 
 
-def _create_vit_backbone(compile_mode=None, use_fa3=False, use_rope_real=False):
+def _create_vit_backbone(compile_mode=None, use_fa3=False, use_rope_real=False, img_size=1008):
     """Create ViT backbone for visual feature extraction."""
     return ViT(
-        img_size=1008,
+        img_size=img_size,
         pretrain_img_size=336,
         patch_size=14,
         embed_dim=1024,
@@ -747,7 +747,7 @@ def build_sam3_video_model(
             assoc_iou_thresh=0.1,
             det_nms_thresh=0.1,
             new_det_thresh=0.7,
-            hotstart_delay=15,
+            hotstart_delay=15,  # NOTE: SAM3使用的一系列hotstart来handle多物体
             hotstart_unmatch_thresh=8,
             hotstart_dup_thresh=8,
             suppress_unmatched_only_within_hotstart=True,
@@ -820,21 +820,25 @@ def build_sam3_video_predictor(*model_args, gpus_to_use=None, **model_kwargs):
     )
 
 
-def _create_multiplex_maskmem_backbone(multiplex_count=16):
+def _create_multiplex_maskmem_backbone(
+        multiplex_count=16,
+        precompute_resolution=1008,
+        interpol_size=(1152, 1152),
+):
     """Create the multiplex memory encoder with per-object mask channels."""
     position_encoding = PositionEmbeddingSine(
         num_pos_feats=256,
         normalize=True,
         scale=None,
         temperature=10000,
-        precompute_resolution=1008,
+        precompute_resolution=precompute_resolution,
     )
 
     mask_downsampler = SimpleMaskDownSampler(
         kernel_size=3,
         stride=2,
         padding=1,
-        interpol_size=[1152, 1152],
+        interpol_size=interpol_size,
         multiplex_count=multiplex_count,
         starting_out_chan=4,
         input_channel_multiplier=2,
@@ -860,14 +864,14 @@ def _create_multiplex_maskmem_backbone(multiplex_count=16):
     return maskmem_backbone
 
 
-def _create_multiplex_transformer(use_fa3=False, use_rope_real=False):
+def _create_multiplex_transformer(use_fa3=False, use_rope_real=False, feat_size=72):
     """Create the decoupled transformer for multiplex memory attention."""
     self_attention_rope = SimpleRoPEAttention(
         d_model=256,
         num_heads=8,
         dropout_p=0.1,
         rope_theta=10000.0,
-        feat_sizes=[72, 72],
+        feat_sizes=[feat_size, feat_size],
         use_fa3=use_fa3,
         use_rope_real=use_rope_real,
     )
@@ -877,7 +881,7 @@ def _create_multiplex_transformer(use_fa3=False, use_rope_real=False):
         num_heads=8,
         dropout_p=0.1,
         rope_theta=10000.0,
-        feat_sizes=[72, 72],
+        feat_sizes=[feat_size, feat_size],
         rope_k_repeat=True,
         use_fa3=use_fa3,
         use_rope_real=use_rope_real,
@@ -918,12 +922,12 @@ def _create_multiplex_transformer(use_fa3=False, use_rope_real=False):
 
 
 def _create_multiplex_tri_backbone(
-    compile_mode=None, use_fa3=False, use_rope_real=False
+    compile_mode=None, use_fa3=False, use_rope_real=False, image_size=1008
 ):
     """Create the TriHead vision backbone for multiplex model."""
-    position_encoding = _create_position_encoding(precompute_resolution=1008)
+    position_encoding = _create_position_encoding(precompute_resolution=image_size)
     vit_backbone = _create_vit_backbone(
-        compile_mode=compile_mode, use_fa3=use_fa3, use_rope_real=use_rope_real
+        compile_mode=compile_mode, use_fa3=use_fa3, use_rope_real=use_rope_real, img_size=image_size
     )
     tri_neck = Sam3TriViTDetNeck(
         trunk=vit_backbone,
@@ -943,6 +947,7 @@ def build_sam3_multiplex_video_model(
     strict_state_dict_loading: bool = True,
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile=False,
+    image_size=1008,
 ):
     """
     Build SAM3 multiplex video tracking model.
@@ -959,15 +964,22 @@ def build_sam3_multiplex_video_model(
     Returns:
         VideoTrackingDynamicMultiplex: The instantiated multiplex tracking model
     """
+    backbone_stride = 14
+    feat_size = image_size // backbone_stride  # 1008→72, 672→48
+    # mask downsampler interpol size: roughly image_size * 8/7 rounded
+    interpol_size = [int(image_size * 8 / 7)] * 2
     # Build multiplex-specific components
     maskmem_backbone = _create_multiplex_maskmem_backbone(
-        multiplex_count=multiplex_count
+        multiplex_count=multiplex_count,
+        precompute_resolution=image_size,
+        interpol_size=interpol_size,
     )
     transformer = _create_multiplex_transformer(
-        use_fa3=use_fa3, use_rope_real=use_rope_real
+        use_fa3=use_fa3, use_rope_real=use_rope_real, feat_size=feat_size,
     )
     tri_neck = _create_multiplex_tri_backbone(
-        compile_mode="max-autotune" if compile else None
+        compile_mode="max-autotune" if compile else None,
+        image_size=image_size,
     )
     backbone = TriHeadVisionOnly(
         visual=tri_neck,
@@ -987,7 +999,7 @@ def build_sam3_multiplex_video_model(
         transformer=transformer,
         maskmem_backbone=maskmem_backbone,
         multiplex_controller=multiplex_controller,
-        image_size=1008,
+        image_size=image_size,
         backbone_stride=14,
         num_maskmem=7,
         # Multiplex-specific settings

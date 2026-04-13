@@ -1076,7 +1076,10 @@ class VideoTrackingMultiplex(nn.Module):
                     backbone_out["sam2_backbone_out"]["backbone_fpn"][1].tensors
                 )
         # Clone to help torch.compile
-        for out_type in backbone_out.keys():
+        # Only iterate over neck output keys, not top-level sam3 keys (vision_features etc.)
+        for out_type in neck_outs:
+            if out_type not in backbone_out:
+                continue
             for i in range(len(backbone_out[out_type]["backbone_fpn"])):
                 backbone_out[out_type]["backbone_fpn"][i].tensors = self._maybe_clone(
                     backbone_out[out_type]["backbone_fpn"][i].tensors
@@ -2396,8 +2399,19 @@ class VideoTrackingMultiplex(nn.Module):
         # Use the final prediction (after all correction steps for output and eval)
         current_out["pred_masks"] = low_res_masks
         current_out["pred_masks_high_res"] = high_res_masks
+
         if self.use_obj_ptrs_in_encoder:
-            # similar to spatial memory, the object pointers are stored with multiplex
+            # When only a subset of objects was interacted, obj_ptr is partial
+            # (shape [len(objects_to_interact), C]). Expand to full before mux.
+            if obj_ptr.shape[0] != multiplex_state.total_valid_entries:
+                full_obj_ptr = obj_ptr.new_zeros(
+                    multiplex_state.total_valid_entries, *obj_ptr.shape[1:]
+                )
+                if objects_to_interact is not None:
+                    full_obj_ptr[objects_to_interact] = obj_ptr
+                else:
+                    full_obj_ptr[: obj_ptr.shape[0]] = obj_ptr
+                obj_ptr = full_obj_ptr
             current_out["obj_ptr"] = multiplex_state.mux(obj_ptr)
         if self.use_memory_selection:
             current_out["object_score_logits"] = object_score_logits
@@ -3268,7 +3282,6 @@ class VideoTrackingDynamicMultiplex(VideoTrackingMultiplex):
         )
 
         # Step 2: Merge the existing state with new encoded features
-        # TODO: Remove this and fix the resolution mismatch
         h, w = prev_output["pred_masks"].shape[-2:]
         mask_output["low_res_masks"] = F.interpolate(
             mask_output["low_res_masks"],
