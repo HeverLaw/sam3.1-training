@@ -32,6 +32,7 @@ from training.utils.checkpoint_utils import (
 )
 from training.utils.data_utils import BatchedVideoDatapoint
 from training.utils.distributed import all_reduce_max, barrier, get_rank
+from training.utils.merge_checkpoint import merge_tracker_into_full_ckpt
 
 from training.utils.logger import Logger, setup_logging
 
@@ -556,6 +557,29 @@ class Trainer:
 
             # Save checkpoint before validating
             self.save_checkpoint(self.epoch + 1)
+
+            # Merge finetuned tracker with pretrained checkpoint for full open-vocab pipeline
+            # Only perform merge on rank 0
+            if self.distributed_rank == 0:
+                unwrapped_model = unwrap_ddp_if_wrapped(self.model)
+                if hasattr(unwrapped_model, "checkpoint_path") and unwrapped_model.checkpoint_path:
+                    latest_ckpt_path = os.path.join(self.checkpoint_conf.save_dir, "checkpoint.pt")
+                    merged_output_path = os.path.join(
+                        self.checkpoint_conf.save_dir,
+                        f"checkpoint_merged.pt",
+                    )
+                    logging.info(
+                        f"Merging finetuned tracker with pretrained: {unwrapped_model.checkpoint_path}"
+                    )
+                    try:
+                        merge_tracker_into_full_ckpt(
+                            pretrained_path=unwrapped_model.checkpoint_path,
+                            finetuned_path=latest_ckpt_path,
+                            output_path=merged_output_path,
+                            verbose=False,
+                        )
+                    except Exception as e:
+                        logging.error(f"Failed to merge checkpoint: {e}")
 
             del dataloader
             gc.collect()
