@@ -1,0 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.7.0+cu126
+torchvision==0.22.0+cu126
+tensorboard
+tensordict
+GPUtil
+hydra-core
+submitit
