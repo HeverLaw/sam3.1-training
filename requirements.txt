@@ -6,3 +6,4 @@ tensordict
 GPUtil
 hydra-core
 submitit
+fvcore

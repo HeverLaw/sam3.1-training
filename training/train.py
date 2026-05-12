@@ -60,40 +60,6 @@ def single_proc_run(local_rank, main_port, cfg, world_size):
     trainer = instantiate(cfg.trainer, _recursive_=False)
     trainer.run()
 
-    # After training, merge finetuned tracker into full SAM3.1 checkpoint (rank 0 only)
-    if local_rank == 0:
-        _maybe_merge_checkpoint(cfg)
-
-
-def _maybe_merge_checkpoint(cfg):
-    """
-    After training finishes, merge finetuned tracker weights into the
-    official SAM3.1 checkpoint to produce a full model that supports
-    both VOS tracking and open-vocabulary detection.
-    """
-    pretrained_path = OmegaConf.select(cfg, "paths.checkpoint", default=None)
-    # Trainer saves checkpoint.pt in save_dir
-    save_dir = OmegaConf.select(cfg, "trainer.checkpoint.save_dir", default=None)
-    if not pretrained_path or not save_dir:
-        return
-
-    finetuned_path = os.path.join(save_dir, "checkpoint.pt")
-    if not os.path.exists(finetuned_path):
-        logging.warning(f"No finetuned checkpoint found at {finetuned_path}, skipping merge.")
-        return
-
-    output_path = os.path.join(save_dir, "sam3.1_merged.pt")
-    try:
-        from training.utils.merge_checkpoint import merge_tracker_into_full_ckpt
-        merge_tracker_into_full_ckpt(
-            pretrained_path=pretrained_path,
-            finetuned_path=finetuned_path,
-            output_path=output_path,
-        )
-        logging.info(f"Merged checkpoint saved to {output_path}")
-    except Exception as e:
-        logging.error(f"Failed to merge checkpoint: {e}")
-
 
 def single_node_runner(cfg, main_port: int):
     assert cfg.launcher.num_nodes == 1

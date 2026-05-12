@@ -201,6 +201,7 @@ class SAM3MultiplexTrain(VideoTrackingDynamicMultiplex):
 
         # ── Dynamic object appearance augmentation ──
         self.dynamic_object_delay_prob = dynamic_object_delay_prob
+        self.checkpoint_path = checkpoint_path
 
         # ── Load checkpoint ──
         # Because we inherit (not wrap), self.load_state_dict() uses keys
