@@ -1011,7 +1011,14 @@ def functional_attention(
         assert dropout == 0.0
         out = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
     else:
-        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+        # Flash SDPA only supports half and bfloat16. Keep the fast production
+        # path while allowing float32 validation and CPU-style fallback.
+        backend = (
+            SDPBackend.FLASH_ATTENTION
+            if q.dtype in (torch.float16, torch.bfloat16)
+            else SDPBackend.MATH
+        )
+        with sdpa_kernel(backend):
             out = torchF.scaled_dot_product_attention(q, k, v, dropout_p=dropout)
         out = out.transpose(1, 2)  #  B * n * n_heads * (cv // num_heads)
 

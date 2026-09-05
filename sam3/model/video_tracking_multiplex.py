@@ -2797,6 +2797,14 @@ class VideoTrackingDynamicMultiplex(VideoTrackingMultiplex):
         self.max_trans_frames_in_attn = max_trans_frames_in_attn
         self.is_dynamic_vos_evaluation = is_dynamic_vos_evaluation
 
+    def _prepare_object_admission(self, backbone_out, input, start_frame_idx):
+        """Training adapters may restrict discovery after initial frames are sampled.
+
+        This hook must not change physical masks or resample prompt metadata.
+        The default leaves the official dynamic tracking behavior unchanged.
+        """
+        pass
+
     def prepare_prompt_inputs(self, backbone_out, input, start_frame_idx=0):
         """
         Prepare input mask, point or box prompts. Optionally, we allow tracking from
@@ -2838,6 +2846,7 @@ class VideoTrackingDynamicMultiplex(VideoTrackingMultiplex):
         backbone_out = super()._prepare_prompt_inputs_meta(
             backbone_out, input, start_frame_idx=start_frame_idx
         )
+        self._prepare_object_admission(backbone_out, input, start_frame_idx)
 
         num_frames = backbone_out["num_frames"]
         gt_masks_per_frame = backbone_out["gt_masks_per_frame"]

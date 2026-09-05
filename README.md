@@ -55,14 +55,53 @@ Ensure your dataset is in the expected VOS format (images and masks).
 - **Preprocessing**: You can use the scripts in `data_preprocess/` to convert your dataset if necessary.
 
 ### 2. Configuration
-Select or modify a config file in `training/configs/sam3_multiplex/`. For example, `sam3_multiplex_ev17_finetune_672.yaml` is pre-configured for EndoVis17 at 672 resolution.
+
+The multiplex presets enable GT-preserving partial initial admission by default:
+one initial frame, 30% full initialization and 70% strict partial initialization
+for multi-object video clips. Later object admission and subset correction reuse
+the official dynamic tracker. Set
+`trainer.model.prob_condition_all_objects_on_init_for_train: 1.0` to disable
+partial initialization. Do not use the removed GT-erasing delay augmentation.
+
+| Config (relative to `training/`) | Resolution | Batch | Backbone |
+|---|---|---|---|
+| `configs/sam3_surgical/sam3_multiplex_ev17_finetune_672.yaml` | 672 | 4 | Train final ViT blocks 24–31 |
+| `configs/sam3_surgical/sam3_multiplex_ev17_finetune.yaml` | 1008 | 1 | Frozen |
+| `configs/sam3_multiplex/sam3.1_multiplex_MOSE_ft_1008.yaml` | 1008 | 4 | Frozen |
+
+Edit the selected YAML's `dataset.img_folder`, `dataset.gt_folder`, and
+`paths.checkpoint` for your machine. Defaults expect EndoVis17 under
+`./data/VOS-Endovis17/train/{images,masks}`, MOSE under
+`./data/MOSE/train/{images,masks}`, and release weights at
+`./checkpoints/sam3.1_multiplex.pt`. These are local directory conventions, not
+automatic downloads. Both image and mask roots must have matching video
+subdirectories; use numeric frame filenames, JPG/PNG images and matching
+palette PNG masks with object IDs.
+
+The EV17 672/batch4 preset has passed a real one-step Trainer smoke test with AMP
+and release weights. The two 1008 presets have not been revalidated on their
+datasets after this configuration update. Adjust `scratch.train_batch_size` for
+available GPU memory; the filenames retain their documented resolutions.
 
 ### 3. Start Training
-Run the training script using torchrun for distributed training:
+
+Run from the repository root in the Linux CUDA training environment. The launcher
+handles local worker processes; its config argument is `-c` / `--config`:
 
 ```bash
-python training/train.py --config-name sam3_multiplex/sam3_multiplex_ev17_finetune_672
+# EV17 at 672 (server-validated preset)
+python -m training.train -c configs/sam3_surgical/sam3_multiplex_ev17_finetune_672.yaml --use-cluster 0 --num-gpus 1
+
+# EV17 at 1008
+python -m training.train -c configs/sam3_surgical/sam3_multiplex_ev17_finetune.yaml --use-cluster 0 --num-gpus 1
+
+# MOSE at 1008
+python -m training.train -c configs/sam3_multiplex/sam3.1_multiplex_MOSE_ft_1008.yaml --use-cluster 0 --num-gpus 1
 ```
+
+For an initial smoke run, reduce the selected YAML's `scratch.num_epochs` and
+`dataset.multiplier`; restore them for full training. This CLI does not accept
+arbitrary Hydra `key=value` overrides, so edit the YAML or use a separate config.
 
 ## Acknowledgments
 We would like to thank the authors of [SAM 3](https://github.com/facebookresearch/sam3) for their groundbreaking work and for providing the base architecture upon which this training pipeline is built.

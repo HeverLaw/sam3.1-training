@@ -11,8 +11,9 @@ scratch:
   num_epochs: 40
 
 dataset:
-  img_folder: # path to MOSE training images, e.g. ./data/VOS-Endovis17/train/images
-  gt_folder: # path to MOSE training masks, e.g. ./data/VOS-Endovis17/train/masks
+  # Arrange one subdirectory per video under each root, or edit these paths.
+  img_folder: ./data/MOSE/train/images
+  gt_folder: ./data/MOSE/train/masks
   file_list_txt: null  # Optional: txt file listing video names for training
   multiplier: 2
 
@@ -74,7 +75,7 @@ trainer:
     num_maskmem: 7
     checkpoint_path: ${paths.checkpoint}
 
-    ####### Training specific params (follow SAM2 MOSE finetune exactly) #######
+    ####### Multiplex admission and interactive correction #######
     # box/point input and corrections
     prob_to_use_pt_input_for_train: 0.5
     prob_to_use_pt_input_for_eval: 0.0
@@ -86,13 +87,19 @@ trainer:
     rand_frames_to_correct_for_train: true # random #init-cond-frame ~ 2
     rand_frames_to_correct_for_eval: false
     add_all_frames_to_correct_as_cond: true
-    # maximum 2 initial conditioning frames
-    num_init_cond_frames_for_train: 2
+    # Partial admission requires one initial frame at start_frame_idx.
+    num_init_cond_frames_for_train: 1
     num_init_cond_frames_for_eval: 1
-    rand_init_cond_frames_for_train: true  # random 1~2
+    rand_init_cond_frames_for_train: false
     rand_init_cond_frames_for_eval: false
     num_correction_pt_per_frame: 7
     forward_backbone_per_frame_for_eval: true
+
+    # For N>1: 30% full init, 70% strictly 1..N-1 initially admitted objects.
+    # Physical GT stays unchanged; later admission uses official transitions.
+    prob_condition_all_objects_on_init_for_train: 0.3
+    ratio_of_objects_to_condition_on_init_for_train: 1.0
+    rand_objects_to_condition_on_init_for_train: true
 
     ####### Freeze strategy #######
     freeze_image_encoder: true

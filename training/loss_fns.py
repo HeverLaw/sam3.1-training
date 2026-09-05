@@ -172,11 +172,15 @@ class MultiStepMultiMasksAndIous(nn.Module):
             num_obj_val = targets_batch.shape[1]
             device = targets_batch.device
         else:
-            num_obj_val = targets_batch[0].shape[0]
+            # Normalize by the mean supervised count across this clip. Using
+            # only the initial count inflates loss when objects are admitted
+            # later. This preserves fixed-object behavior and equal weighting
+            # per supervised object-frame (the frame losses are summed below).
+            num_obj_val = sum(t.shape[0] for t in targets_batch) / len(targets_batch)
             device = targets_batch[0].device
         num_objects = torch.tensor(
             num_obj_val, device=device, dtype=torch.float
-        )  # Number of objects is fixed within a batch
+        )
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_objects)
         num_objects = torch.clamp(num_objects / get_world_size(), min=1).item()

@@ -21,7 +21,6 @@ Usage in Hydra config:
 import fnmatch
 import logging
 from typing import List, Optional
-import numpy as np
 
 import torch
 from iopath.common.file_io import g_pathmgr
@@ -89,10 +88,30 @@ class SAM3MultiplexTrain(VideoTrackingDynamicMultiplex):
         use_rope_real: bool = False,
         # --- eval ---
         forward_backbone_per_frame_for_eval: bool = False,
-        # --- dynamic object appearance augmentation ---
-        dynamic_object_delay_prob: float = 0.0,  # prob to delay each object's appearance (0=off)
+        # --- dynamic object admission augmentation ---
+        dynamic_object_delay_prob: float = 0.0,  # legacy option; nonzero is rejected
         prob_to_dropout_spatial_mem: float = 0.0,  # prob to dropout spatial mem for a random frame during training (0=off)
+        prob_condition_all_objects_on_init_for_train: float = 1.0,
+        ratio_of_objects_to_condition_on_init_for_train: float = 1.0,
+        rand_objects_to_condition_on_init_for_train: bool = True,
     ):
+        for name, value in {
+            "prob_condition_all_objects_on_init_for_train": prob_condition_all_objects_on_init_for_train,
+            "ratio_of_objects_to_condition_on_init_for_train": ratio_of_objects_to_condition_on_init_for_train,
+        }.items():
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {value}")
+        if dynamic_object_delay_prob != 0:
+            raise ValueError(
+                "dynamic_object_delay_prob is no longer supported: it erased physical GT. "
+                "Use prob_condition_all_objects_on_init_for_train instead."
+            )
+        if (
+            prob_condition_all_objects_on_init_for_train < 1.0
+            and num_init_cond_frames_for_train != 1
+        ):
+            raise ValueError("Partial initial admission requires num_init_cond_frames_for_train=1")
+
         # ── Build components (resolution-aware, derived from model_builder.py) ──
         backbone_stride = 14
         feat_size = image_size // backbone_stride  # 1008→72, 672→48
@@ -202,8 +221,10 @@ class SAM3MultiplexTrain(VideoTrackingDynamicMultiplex):
 
         self.prob_to_dropout_spatial_mem = prob_to_dropout_spatial_mem  # TODO: should be used in the multiplex training
 
-        # ── Dynamic object appearance augmentation ──
-        self.dynamic_object_delay_prob = dynamic_object_delay_prob
+        # ── Dynamic object admission augmentation ──
+        self.prob_condition_all_objects_on_init_for_train = prob_condition_all_objects_on_init_for_train
+        self.ratio_of_objects_to_condition_on_init_for_train = ratio_of_objects_to_condition_on_init_for_train
+        self.rand_objects_to_condition_on_init_for_train = rand_objects_to_condition_on_init_for_train
         self.checkpoint_path = checkpoint_path
 
         # ── Load checkpoint ──
@@ -285,14 +306,7 @@ class SAM3MultiplexTrain(VideoTrackingDynamicMultiplex):
             backbone_out = {}
 
         # 2. Adapt SAM2 batch to SAM3 interface and prepare prompts
-        if self.training and self.dynamic_object_delay_prob > 0:
-            adapted_input = _SAM2ToSAM3DynamicInputAdapter(
-                input,
-                delay_prob=self.dynamic_object_delay_prob,
-                rng=self.rng,
-            )
-        else:
-            adapted_input = _SAM2ToSAM3InputAdapter(input)
+        adapted_input = _SAM2ToSAM3InputAdapter(input)
         backbone_out = self.prepare_prompt_inputs(backbone_out, adapted_input)
 
         # 3. Run forward_tracking (inherits from VideoTrackingDynamicMultiplex)
@@ -311,6 +325,22 @@ class SAM3MultiplexTrain(VideoTrackingDynamicMultiplex):
         ]
 
         return all_frame_outputs, updated_targets
+
+    def _prepare_object_admission(self, backbone_out, input, start_frame_idx):
+        if not self.training:
+            return
+        if not self.enable_dynamic_training and (
+            self.prob_condition_all_objects_on_init_for_train < 1.0
+        ):
+            raise ValueError("Object admission augmentation requires dynamic training")
+        input.prepare_object_admission(
+            init_cond_frames=backbone_out["init_cond_frames"],
+            start_frame_idx=start_frame_idx,
+            prob_all=self.prob_condition_all_objects_on_init_for_train,
+            ratio=self.ratio_of_objects_to_condition_on_init_for_train,
+            random_count=self.rand_objects_to_condition_on_init_for_train,
+            rng=self.rng2,
+        )
 
     def _apply_high_res_feature_projections(self, backbone_out):
         """
@@ -396,11 +426,19 @@ class SAM3MultiplexTrain(VideoTrackingDynamicMultiplex):
         model_state = self.state_dict()
         filtered_ckpt = {}
         skipped = []
+        ignored = []
         for k, v in ckpt.items():
-            if k in model_state and v.shape != model_state[k].shape:
+            if k not in model_state:
+                ignored.append(k)
+            elif v.shape != model_state[k].shape:
                 skipped.append(f"{k}: ckpt {v.shape} vs model {model_state[k].shape}")
             else:
                 filtered_ckpt[k] = v
+        if ignored:
+            print(
+                f"[SAM3MultiplexTrain] Ignored {len(ignored)} checkpoint-only keys "
+                f"(first 10: {ignored[:10]})"
+            )
         if skipped:
             print(f"[SAM3MultiplexTrain] Skipped {len(skipped)} keys with shape mismatch:")
             for s in skipped:
@@ -528,6 +566,9 @@ class _SAM2ToSAM3InputAdapter:
         num_frames = sam2_batch.num_frames
         num_objects = sam2_batch.masks.shape[1]
         device = sam2_batch.masks.device
+        # Immutable-by-contract physical targets, before official reordering/slicing.
+        # Keeping references is sufficient: admission never writes mask pixels.
+        self.physical_masks = sam2_batch.masks
 
         # find_inputs: per-frame img_ids
         self.find_inputs = []
@@ -552,106 +593,52 @@ class _SAM2ToSAM3InputAdapter:
                     visible.add(obj_idx)
             self.visible_objects_per_frame[t] = visible
 
+        self.physical_visible_objects_per_frame = {
+            t: frozenset(ids) for t, ids in self.visible_objects_per_frame.items()
+        }
 
-class _SAM2ToSAM3DynamicInputAdapter:
-    """
-    Like _SAM2ToSAM3InputAdapter, but randomly delays the "appearance" of some
-    objects to simulate mid-video object addition for dynamic multiplex training.
+    def prepare_object_admission(
+        self,
+        *,
+        init_cond_frames,
+        start_frame_idx,
+        prob_all,
+        ratio,
+        random_count,
+        rng,
+    ):
+        """Restrict discovery, never physical presence or target mask pixels.
 
-    For each object (except at least one on the first frame), we randomly pick
-    a later frame from its visible frames as its new "first appearance", and
-    zero out its GT masks on all earlier frames.
+        Called after the official initial-frame sampler and before its object union.
+        A discoverable object is admitted only at an official sampled transition.
+        It can remain unknown for the entire clip if no transition sees it.
+        """
+        physical = self.physical_visible_objects_per_frame
+        if not physical[start_frame_idx]:
+            # The upstream empty-start fallback zeroes object 0 across the clip.
+            # Reject this sample explicitly rather than corrupting physical GT.
+            raise ValueError(
+                "Empty initial frame after transforms; resample the clip instead of zeroing GT"
+            )
+        self.visible_objects_per_frame = {t: set(ids) for t, ids in physical.items()}
+        if prob_all == 1.0:
+            return
+        if len(init_cond_frames) != 1 or init_cond_frames[0] != start_frame_idx:
+            raise ValueError(
+                "Object admission augmentation supports one selected initial frame only"
+            )
 
-    Args:
-        sam2_batch: the SAM2 BatchedVideoDatapoint
-        delay_prob: probability of delaying each non-essential object (default 0.5)
-        rng: numpy random generator (for reproducibility with SAM3's rng)
-    """
-
-    def __init__(self, sam2_batch: BatchedVideoDatapoint, delay_prob: float = 0.5, rng=None):
-        if rng is None:
-            rng = np.random.default_rng()
-
-        self.img_batch = NestedTensor(
-            tensors=sam2_batch.flat_img_batch, mask=None
-        )
-
-        num_frames = sam2_batch.num_frames
-        num_objects = sam2_batch.masks.shape[1]
-        device = sam2_batch.masks.device
-
-        # Build per-object list of visible frames
-        obj_visible_frames = {}  # obj_idx -> sorted list of frame indices where mask is non-empty
-        for obj_idx in range(num_objects):
-            visible = []
-            for t in range(num_frames):
-                if sam2_batch.masks[t][obj_idx].any():
-                    visible.append(t)
-            obj_visible_frames[obj_idx] = visible
-
-        # Decide delayed start for each object
-        # Rule: at least one object must keep its original first-frame visibility
-        first_frame_objects = [
-            idx for idx in range(num_objects)
-            if 0 in obj_visible_frames.get(idx, []) and len(obj_visible_frames.get(idx, [])) > 0
-        ]
-
-        # Randomly select one object to protect (must remain on first frame)
-        if first_frame_objects:
-            protected_obj = rng.choice(first_frame_objects)
-        else:
-            protected_obj = None
-
-        # For each object, decide its delayed start frame
-        obj_delayed_start = {}  # obj_idx -> frame index where it "appears"
-        for obj_idx in range(num_objects):
-            visible = obj_visible_frames[obj_idx]
-            if not visible:
-                continue
-            original_start = visible[0]
-
-            # Don't delay the protected object
-            if obj_idx == protected_obj:
-                obj_delayed_start[obj_idx] = original_start
-                continue
-
-            # With delay_prob, pick a random later visible frame as start
-            if rng.random() < delay_prob and len(visible) > 1:
-                # Pick from visible frames (excluding the first one, or including it with low weight)
-                delayed_start = rng.choice(visible[1:])
-                obj_delayed_start[obj_idx] = delayed_start
-            else:
-                obj_delayed_start[obj_idx] = original_start
-
-        # Build masks with delayed objects zeroed out on early frames
-        # Clone masks so we don't modify the original batch
-        delayed_masks = sam2_batch.masks.clone()  # [T, O, H, W]
-        for obj_idx, start_frame in obj_delayed_start.items():
-            for t in range(num_frames):
-                if t < start_frame:
-                    delayed_masks[t][obj_idx] = 0
-
-        # find_inputs: per-frame img_ids
-        self.find_inputs = []
-        for t in range(num_frames):
-            img_ids = sam2_batch.flat_obj_to_img_idx[t]  # [O]
-            self.find_inputs.append(_FindStageProxy(img_ids))
-
-        # find_targets: per-frame GT masks (using delayed masks)
-        self.find_targets = []
-        for t in range(num_frames):
-            seg = delayed_masks[t]  # [O, H, W]
-            num_boxes = torch.ones(seg.shape[0], device=device)
-            self.find_targets.append(_FindTargetProxy(seg, num_boxes))
-
-        # visible_objects_per_frame: based on delayed masks
-        self.visible_objects_per_frame = {}
-        for t in range(num_frames):
-            visible = set()
-            for obj_idx in range(num_objects):
-                if delayed_masks[t][obj_idx].any():
-                    visible.add(obj_idx)
-            self.visible_objects_per_frame[t] = visible
+        init_frame = init_cond_frames[0]
+        init_objects = sorted(physical[init_frame])
+        # A static-image episode has no opportunity for subsequent admission.
+        if len(physical) - init_frame <= 1:
+            return
+        selected = set(init_objects)
+        if len(init_objects) > 1 and rng.random() >= prob_all:
+            max_num = min(len(init_objects) - 1, max(1, int(len(init_objects) * ratio)))
+            count = int(rng.integers(1, max_num + 1)) if random_count else max_num
+            selected = set(rng.choice(init_objects, size=count, replace=False).tolist())
+        self.visible_objects_per_frame[init_frame] = selected
 
 
 # ═══════════════════════════════════════════════════════════
