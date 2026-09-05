@@ -91,6 +91,7 @@ class SAM3MultiplexTrain(VideoTrackingDynamicMultiplex):
         forward_backbone_per_frame_for_eval: bool = False,
         # --- dynamic object appearance augmentation ---
         dynamic_object_delay_prob: float = 0.0,  # prob to delay each object's appearance (0=off)
+        prob_to_dropout_spatial_mem: float = 0.0,  # prob to dropout spatial mem for a random frame during training (0=off)
     ):
         # ── Build components (resolution-aware, derived from model_builder.py) ──
         backbone_stride = 14
@@ -198,6 +199,8 @@ class SAM3MultiplexTrain(VideoTrackingDynamicMultiplex):
             use_memory_selection=False,
             share_necks=False,
         )
+
+        self.prob_to_dropout_spatial_mem = prob_to_dropout_spatial_mem  # TODO: should be used in the multiplex training
 
         # ── Dynamic object appearance augmentation ──
         self.dynamic_object_delay_prob = dynamic_object_delay_prob
